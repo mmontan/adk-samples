@@ -209,7 +209,7 @@ The database structure is defined by the following table schemas (possibly with 
 def run_bigquery_validation(
     sql_string: str,
     tool_context: ToolContext,
-) -> str:
+) -> dict:  # Return type changed to dict
     """Validates BigQuery SQL syntax and functionality.
 
     This function validates the provided SQL string by attempting to execute it
@@ -238,6 +238,9 @@ def run_bigquery_validation(
              - "Invalid SQL: ..." if the query is invalid, along with the error
                 message from BigQuery.
     """
+
+    allowed_project_id = tool_context.state["database_settings"]["bq_project_id"]
+    allowed_dataset_id = tool_context.state["database_settings"]["bq_dataset_id"]
 
     def cleanup_sql(sql_string):
         """Processes the SQL string to get a printable, valid SQL string."""
@@ -273,6 +276,28 @@ def run_bigquery_validation(
         final_result["error_message"] = (
             "Invalid SQL: Contains disallowed DML/DDL operations."
         )
+        return final_result
+
+    # Perform dry run for dataset access validation
+    try:
+        job_config = bigquery.QueryJobConfig(dry_run=True, use_query_cache=False)
+        dry_run_job = get_bq_client().query(sql_string, job_config=job_config)
+
+        if dry_run_job.referenced_tables:
+            accessed_datasets = set()
+            for table_ref in dry_run_job.referenced_tables:
+                accessed_datasets.add((table_ref.project, table_ref.dataset_id))
+
+            for proj, dset in accessed_datasets:
+                if proj != allowed_project_id or dset != allowed_dataset_id:
+                    final_result["error_message"] = (
+                        f"Invalid SQL: Query attempts to access unauthorized dataset '{proj}.{dset}'. "
+                        f"Only access to '{allowed_project_id}.{allowed_dataset_id}' is permitted."
+                    )
+                    return final_result
+    except Exception as e:
+        # Catch errors from the dry run itself (e.g. syntax errors)
+        final_result["error_message"] = f"Invalid SQL (dry run failed): {e}"
         return final_result
 
     try:
