@@ -291,6 +291,9 @@ class CaMelInterpreterService(BaseModel):
   eval_args: interpreter.EvalArgs
   namespace: Namespace
   quarantined_llm_service: QuarantinedLlmService
+  request_queue: queue.Queue[Any]
+  response_queue: queue.Queue[Any]
+  interpreter_thread: threading.Thread
 
   model_config = {"arbitrary_types_allowed": True}
 
@@ -329,6 +332,15 @@ class CaMelInterpreterService(BaseModel):
             if hasattr(f, "__name__")
         }
     )
+    request_queue = queue.Queue()
+    response_queue = queue.Queue()
+
+    interpreter_thread = threading.Thread(
+        target=self._interpreter_worker,
+        args=(request_queue, response_queue, namespace, eval_args),
+        daemon=True,
+    )
+    interpreter_thread.start()
 
     super().__init__(
         model=model,
@@ -337,7 +349,43 @@ class CaMelInterpreterService(BaseModel):
         eval_args=eval_args,
         namespace=namespace,
         quarantined_llm_service=quarantined_llm_service,
+        request_queue=request_queue,
+        response_queue=response_queue,
+        interpreter_thread=interpreter_thread,
     )
+
+  def _interpreter_worker(
+      self,
+      request_queue: queue.Queue[Any],
+      response_queue: queue.Queue[Any],
+      namespace: Namespace,
+      eval_args: interpreter.EvalArgs,
+  ):
+    while True:
+      code, tool_calls_chain, current_dependencies = request_queue.get()
+      if code is None:  # Sentinel value to stop the thread
+        break
+      (
+          interpreter_res,
+          updated_namespace,
+          new_tool_calls,
+          new_dependencies,
+      ) = interpreter.parse_and_interpret_code(
+          code,
+          namespace,
+          tool_calls_chain,
+          current_dependencies,
+          eval_args,
+      )
+      namespace = updated_namespace
+      response_queue.put(
+          (
+              interpreter_res,
+              updated_namespace,
+              new_tool_calls,
+              new_dependencies,
+          )
+      )
 
   def get_funcs_for_pllm_prompt(self) -> list[Callable[..., Any]]:
     return [f for f, _, _ in self.tools if hasattr(f, "__name__")]
@@ -362,16 +410,14 @@ class CaMelInterpreterService(BaseModel):
     if verbose:
       print(code)
 
-    # The namespace passed here is self.namespace, which is managed internally
-    interpreter_res, updated_namespace, new_tool_calls, new_dependencies = (
-        interpreter.parse_and_interpret_code(
-            code,
-            self.namespace,
-            tool_calls_chain,
-            current_dependencies,
-            self.eval_args,
-        )
-    )
+    self.request_queue.put((code, tool_calls_chain, current_dependencies))
+    (
+        interpreter_res,
+        updated_namespace,
+        new_tool_calls,
+        new_dependencies,
+    ) = self.response_queue.get()
+
     self.namespace = updated_namespace  # Update internal namespace state
 
     printed_output = utils.extract_print_output(new_tool_calls)
@@ -441,10 +487,11 @@ class CaMeLInterpreter(BaseAgent):
     function_calls = ctx.session.state.get("function_calls") or []
     dependencies = ctx.session.state.get("dependencies") or ()
 
-    printed_output, ad_tool_calls, error, _, dependencies = (
-        self.camel_interpreter_service.execute_code(
-            p_llm_code, function_calls, dependencies
-        )
+    printed_output, ad_tool_calls, error, _, dependencies = await asyncio.to_thread(
+        self.camel_interpreter_service.execute_code,
+        p_llm_code,
+        function_calls,
+        dependencies,
     )  # printed_output, ad_tool_calls, error, namespace, dependencies
 
     ctx.session.state.update(dict(function_calls=ad_tool_calls))
