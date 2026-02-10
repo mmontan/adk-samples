@@ -107,6 +107,13 @@ class LlmAsAJudge(BasePlugin):
 
     async def _is_unsafe(self, message: str) -> bool:
         """Runs the LLM as a judge on the given message."""
+        # Strip tags to check if the content itself is empty
+        content = message
+        for tag in ["<user_message>", "</user_message>", "<tool_call>", "</tool_call>", "<tool_output>", "</tool_output>", "<model_output>", "</model_output>"]:
+            content = content.replace(tag, "")
+        
+        if not content.strip():
+            return False
 
         author, judge_analysis = await util.run_prompt(
             user_id=self._judge_user_id,

@@ -105,6 +105,8 @@ class ModelArmorSafetyFilterPlugin(BasePlugin):
         text: str,
     ) -> list[tuple[str, Any]]:
         """Gets the Model Armor response for the given text and method."""
+        if not text or not text.strip():
+            return []
         if method == "sanitizeUserPrompt":
             response = self._sanitize_user_prompt(text)
         elif method == "sanitizeModelResponse":
